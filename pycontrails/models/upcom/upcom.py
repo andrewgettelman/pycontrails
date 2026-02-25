@@ -1,0 +1,319 @@
+"""Unified Parametric Contrail Model (UPCOM)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, overload
+
+import numpy as np
+import xarray as xr
+
+import pycontrails
+from pycontrails.core.flight import Flight
+from pycontrails.core.met import MetDataset
+from pycontrails.core.met_var import AirTemperature, MetVariable, SpecificHumidity
+from pycontrails.core.models import Model, ModelParams
+from pycontrails.core.vector import GeoVectorDataset
+from pycontrails.models.humidity_scaling import HumidityScaling
+from pycontrails.physics import constants, thermo
+from pycontrails.utils.types import ArrayLike
+
+
+@dataclass
+class UPCOMParams(ModelParams):
+    """UPCOM model parameters for contrail formation analysis."""
+
+    # Ice supersaturation threshold
+    rhi_threshold: float = 1.0
+
+    # Schmidt-Appleman contrail formation parameters
+    # Based on Schumann (1996) and Ponater et al. (2002)
+    ei_h2o: float = 1.21  # Water vapor emission index [kg H2O / kg fuel]
+    Q: float = 43.0e6  # Specific combustion heat [J/kg]
+    eta: float = 0.3  # Propulsion efficiency (dimensionless)
+
+    # Humidity scaling
+    humidity_scaling: HumidityScaling | None = None
+
+
+class UPCOM(Model):
+    """Unified Parametric Contrail Model - Grid Analysis.
+
+    This model identifies regions favorable for persistent contrail formation
+    using the Schmidt-Appleman criterion (Schumann 1996, Ponater et al. 2002).
+
+    The model calculates:
+    - Ice supersaturated regions (ISSR) where RHi > threshold
+    - Critical temperature and humidity thresholds for contrail formation
+    - Regions where conditions favor persistent contrails
+
+    Parameters
+    ----------
+    met : MetDataset
+        Dataset containing "air_temperature" and "specific_humidity" variables
+
+    Examples
+    --------
+    >>> from datetime import datetime
+    >>> from pycontrails.datalib.ecmwf import ERA5
+    >>> from pycontrails.models.upcom import UPCOM
+    >>> from pycontrails.models.humidity_scaling import ConstantHumidityScaling
+
+    >>> # Get met data
+    >>> time = datetime(2022, 3, 1, 0), datetime(2022, 3, 1, 2)
+    >>> variables = ["air_temperature", "specific_humidity"]
+    >>> pressure_levels = [200, 250, 300]
+    >>> era5 = ERA5(time, variables, pressure_levels)
+    >>> met = era5.open_metdataset()
+
+    >>> # Instantiate and run model
+    >>> scaling = ConstantHumidityScaling(rhi_adj=0.98)
+    >>> model = UPCOM(met, humidity_scaling=scaling)
+    >>> out = model.eval()
+    >>> persistent = out["potential_persistent_contrail"]
+
+    References
+    ----------
+    - Schumann, U. (1996). On conditions for contrail formation from aircraft exhausts.
+      Meteorologische Zeitschrift, 5(1), 4-23.
+    - Ponater, M., Marquart, S., & Sausen, R. (2002). Contrails in a comprehensive
+      global climate model: Parameterization and radiative forcing results.
+      Journal of Geophysical Research, 107(D13), ACL 2-1.
+    """
+
+    name = "upcom"
+    long_name = "Unified Parametric Contrail Model"
+    met_variables: tuple[MetVariable, ...] = AirTemperature, SpecificHumidity
+    default_params = UPCOMParams
+
+    @overload
+    def eval(self, source: Flight, **params: Any) -> Flight: ...
+
+    @overload
+    def eval(self, source: GeoVectorDataset, **params: Any) -> GeoVectorDataset: ...
+
+    @overload
+    def eval(self, source: MetDataset | None = ..., **params: Any) -> MetDataset: ...
+
+    def eval(
+        self, source: GeoVectorDataset | Flight | MetDataset | None = None, **params: Any
+    ) -> GeoVectorDataset | Flight | MetDataset:
+        """Evaluate contrail formation conditions along trajectory or on meteorology grid.
+
+        Parameters
+        ----------
+        source : GeoVectorDataset | Flight | MetDataset | None, optional
+            Input GeoVectorDataset or Flight.
+            If None, evaluates at the :attr:`met` grid points.
+        **params : Any
+            Overwrite model parameters before eval
+
+        Returns
+        -------
+        GeoVectorDataset | Flight | MetDataset
+            Returns source with additional data variables:
+            - ``rhi``: Relative humidity over ice
+            - ``rh_liquid``: Relative humidity over liquid water
+            - ``issr``: Ice supersaturated regions (1 where RHi > threshold, 0 elsewhere)
+            - ``G``: Schmidt-Appleman G parameter
+            - ``T_contr``: Critical contrail formation temperature [K]
+            - ``RH_contr``: Critical relative humidity threshold
+            - ``potential_persistent_contrail``: Regions favorable for persistent contrails
+
+        Raises
+        ------
+        NotImplementedError
+            Raises if input ``source`` is not supported.
+        """
+
+        self.update_params(params)
+        self.set_source(source)
+
+        if isinstance(self.source, GeoVectorDataset):
+            self.downselect_met()
+            self.source.setdefault("air_pressure", self.source.air_pressure)
+
+        humidity_scaling = self.params["humidity_scaling"]
+        scale_humidity = humidity_scaling is not None and "specific_humidity" not in self.source
+
+        self.set_source_met()
+
+        # Apply humidity scaling, warn if no scaling is provided for ECMWF data
+        if scale_humidity:
+            humidity_scaling.eval(self.source, copy_source=False)
+
+        # Extract variables
+        air_temperature = self.source.data["air_temperature"]
+        specific_humidity = self.source.data["specific_humidity"]
+        air_pressure = self.source.data["air_pressure"]
+        
+        # Broadcast air_pressure to match temperature dimensions
+        # xarray arithmetic will handle broadcasting automatically
+        # No need to manually broadcast - just use the coordinates as-is
+
+        # Calculate relative humidity over ice
+        rhi = thermo.rhi(specific_humidity, air_temperature, air_pressure)
+
+        # Calculate relative humidity over liquid water
+        rh_liquid = thermo.rh(specific_humidity, air_temperature, air_pressure)
+
+        # Create ISSR mask
+        issr = (rhi > self.params["rhi_threshold"]).astype(rhi.dtype)
+
+        # Calculate Schmidt-Appleman contrail formation thresholds
+        epsilon = constants.epsilon
+        cp_air = constants.c_pd
+        ei_h2o = self.params["ei_h2o"]
+        Q = self.params["Q"]
+        eta = self.params["eta"]
+        
+        # Broadcast air_pressure to match temperature's dimensions
+        # Use broadcast_like which preserves dimension order
+        if hasattr(air_pressure, 'broadcast_like'):
+            # For xarray DataArrays, use broadcast_like to match dimensions exactly
+            air_pressure_broadcast = air_pressure.broadcast_like(air_temperature)
+        else:
+            # For numpy arrays, just use as-is
+            air_pressure_broadcast = air_pressure
+        
+        # Now compute G with the broadcast pressure
+        G = (ei_h2o * cp_air * air_pressure_broadcast) / (epsilon * Q * (1.0 - eta))
+        
+        # Calculate the threshold values
+        T_contr, RH_contr = calculate_contrail_temperature_and_rh(
+            air_temperature,
+            air_pressure_broadcast,
+            G,
+        )
+
+        # Calculate potential persistent contrail regions
+        # All three conditions must be met:
+        # 1. Ice supersaturated (RHi > 1.0)
+        # 2. Temperature below critical threshold
+        # 3. RH over liquid above critical threshold
+        potential_persistent_contrail = (
+            (rhi > 1.0) & (air_temperature < T_contr) & (rh_liquid > RH_contr)
+        ).astype(rhi.dtype)
+
+        # Update source with calculated fields and set proper attributes
+        self.source.data["rhi"] = rhi
+        self.source.data["rhi"].attrs = {
+            "long_name": "Relative humidity over ice",
+            "units": "dimensionless",
+        }
+        
+        self.source.data["rh_liquid"] = rh_liquid
+        self.source.data["rh_liquid"].attrs = {
+            "long_name": "Relative humidity over liquid water",
+            "units": "dimensionless",
+        }
+        
+        self.source.data["issr"] = issr
+        self.source.data["issr"].attrs = {
+            "long_name": "Ice supersaturated region",
+            "units": "dimensionless",
+            "description": "1 where RHi > threshold, 0 elsewhere",
+        }
+        
+        self.source.data["G"] = G
+        self.source.data["G"].attrs = {
+            "long_name": "Schmidt-Appleman G parameter",
+            "units": "dimensionless",
+            "description": "Slope of mixing line in T-q diagram",
+        }
+        
+        self.source.data["T_contr"] = T_contr
+        self.source.data["T_contr"].attrs = {
+            "long_name": "Critical contrail formation temperature",
+            "standard_name": "contrail_formation_temperature",
+            "units": "K",
+            "description": "Temperature threshold for contrail formation (Schmidt-Appleman criterion)",
+        }
+        
+        self.source.data["RH_contr"] = RH_contr
+        self.source.data["RH_contr"].attrs = {
+            "long_name": "Critical relative humidity threshold",
+            "units": "dimensionless",
+            "description": "RH over liquid water threshold for contrail formation",
+        }
+        
+        self.source.data["potential_persistent_contrail"] = potential_persistent_contrail
+        self.source.data["potential_persistent_contrail"].attrs = {
+            "long_name": "Potential persistent contrail regions",
+            "units": "dimensionless",
+            "description": "1 where conditions favor persistent contrails, 0 elsewhere",
+        }
+
+        # Tag output with additional metadata attrs
+        self.transfer_met_source_attrs()
+        self.source.attrs["pycontrails_version"] = pycontrails.__version__
+        self.source.attrs["upcom_ei_h2o"] = self.params["ei_h2o"]
+        self.source.attrs["upcom_Q"] = self.params["Q"]
+        self.source.attrs["upcom_eta"] = self.params["eta"]
+        self.source.attrs["upcom_rhi_threshold"] = self.params["rhi_threshold"]
+
+        if scale_humidity:
+            for k, v in humidity_scaling.description.items():
+                self.source.attrs[f"humidity_scaling_{k}"] = v
+
+        return self.source
+
+
+def calculate_contrail_temperature_and_rh(
+    air_temperature: ArrayLike,
+    air_pressure: ArrayLike,
+    G: ArrayLike,
+) -> tuple[ArrayLike, ArrayLike]:
+    """Calculate critical temperature and RH thresholds from G parameter.
+
+    Based on the work of Schumann (1996) and Ponater et al. (2002).
+
+    Parameters
+    ----------
+    air_temperature : ArrayLike
+        Air temperature, [:math:`K`]
+    air_pressure : ArrayLike
+        Air pressure, [:math:`Pa`]
+    G : ArrayLike
+        Schmidt-Appleman G parameter (dimensionless), already broadcast to grid
+
+    Returns
+    -------
+    T_contr : ArrayLike
+        Critical contrail formation temperature, [:math:`K`].
+        NaN where G <= 0.053 (conditions not suitable for contrails)
+    RH_contr : ArrayLike
+        Critical relative humidity threshold (dimensionless, [0-1])
+
+    References
+    ----------
+    - Schumann, U. (1996). On conditions for contrail formation from aircraft exhausts.
+      Meteorologische Zeitschrift, 5(1), 4-23.
+    - Ponater, M., Marquart, S., & Sausen, R. (2002). Contrails in a comprehensive
+      global climate model: Parameterization and radiative forcing results.
+      Journal of Geophysical Research, 107(D13), ACL 2-1.
+    """
+
+    # Critical contrail temperature (Eq. 6, Ponater et al. 2002)
+    # Only valid when G > 0.053
+    # Use xr.where to preserve xarray structure
+    mask = G > 0.053
+    
+    # Calculate temperature threshold in Celsius where valid
+    # xr.where preserves DataArray structure while np.where strips it
+    log_term = xr.where(mask, np.log(G - 0.053), np.nan)
+    T_contr_C = -46.46 + 9.43 * log_term + 0.72 * log_term**2
+
+    # Convert to Kelvin (absolute_zero is -273.15, so subtract it to convert C to K)
+    T_contr = xr.where(mask, T_contr_C - constants.absolute_zero, np.nan)
+
+    # Critical RH over liquid water
+    # Use xarray arithmetic which handles broadcasting
+    esat_l = thermo.e_sat_liquid(air_temperature)
+    RH_contr = (G * (air_temperature - T_contr) + esat_l) / esat_l
+
+    # Clip RH_contr to [0, 1] - use xr.where to preserve structure
+    RH_contr = xr.where(RH_contr < 0, 0.0, RH_contr)
+    RH_contr = xr.where(RH_contr > 1, 1.0, RH_contr)
+
+    return T_contr, RH_contr
