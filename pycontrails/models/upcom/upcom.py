@@ -15,7 +15,7 @@ from pycontrails.core.met_var import AirTemperature, MetVariable, SpecificHumidi
 from pycontrails.core.models import Model, ModelParams
 from pycontrails.core.vector import GeoVectorDataset
 from pycontrails.models.humidity_scaling import HumidityScaling
-from pycontrails.physics import constants, thermo
+from pycontrails.physics import thermo
 from pycontrails.utils.types import ArrayLike
 
 
@@ -34,6 +34,50 @@ class UPCOMParams(ModelParams):
 
     # Humidity scaling
     humidity_scaling: HumidityScaling | None = None
+
+    # --- Operational mode ---
+
+    #: If True, use only the hard-coded physical constants defined below.
+    #: No import from pycontrails.physics.constants will occur.
+    #: If False (default), constants are loaded from pycontrails.physics.constants
+    #: on initialisation and the hard-coded defaults serve as documented fallback values.
+    standalone: bool = False
+
+    # --- Physical constants ---
+    # Hard-coded defaults are numerically identical to pycontrails.physics.constants values.
+    # When standalone=False (default), __post_init__ overwrites these with the pycontrails values.
+
+    #: Absolute zero temperature [C].
+    #: Used to convert Celsius to Kelvin: T_K = T_C - tzeroC.
+    #: pycontrails source: constants.absolute_zero = -273.15
+    tzeroC: float = -273.15
+
+    #: Isobaric heat capacity of dry air [J kg-1 K-1].
+    #: pycontrails source: constants.c_pd = 1004.0
+    cp_air: float = 1004.0
+
+    #: Ratio of gas constants for dry air to water vapour [dimensionless].
+    #: epsilon = R_d / R_v = 287.05 / 461.51.
+    #: pycontrails source: constants.epsilon = R_d / R_v
+    epsilon: float = 287.05 / 461.51
+
+    def __post_init__(self) -> None:
+        """Load physical constants from pycontrails when not running in standalone mode.
+
+        In standalone mode (``standalone=True``), the hard-coded field defaults above
+        are used unchanged.  In the default mode (``standalone=False``), the values are
+        overwritten from ``pycontrails.physics.constants`` so that UPCOM always stays
+        in sync with the rest of the pycontrails library.
+        """
+        if not self.standalone:
+            from pycontrails.physics import constants as _pc_constants  # noqa: PLC0415
+
+            # Absolute zero [C]; equivalent hard-coded value: -273.15
+            self.tzeroC = _pc_constants.absolute_zero
+            # Isobaric heat capacity of dry air [J kg-1 K-1]; equivalent: 1004.0
+            self.cp_air = _pc_constants.c_pd
+            # Ratio R_d / R_v [dimensionless]; equivalent: 287.05 / 461.51
+            self.epsilon = _pc_constants.epsilon
 
 
 class UPCOM(Model):
@@ -161,8 +205,9 @@ class UPCOM(Model):
         issr = (rhi > self.params["rhi_threshold"]).astype(rhi.dtype)
 
         # Calculate Schmidt-Appleman contrail formation thresholds
-        epsilon = constants.epsilon
-        cp_air = constants.c_pd
+        # Physical constants are held in params (loaded from pycontrails or hard-coded)
+        epsilon = self.params["epsilon"]
+        cp_air = self.params["cp_air"]
         ei_h2o = self.params["ei_h2o"]
         Q = self.params["Q"]
         eta = self.params["eta"]
@@ -184,6 +229,7 @@ class UPCOM(Model):
             air_temperature,
             air_pressure_broadcast,
             G,
+            tzeroC=self.params["tzeroC"],
         )
 
         # Calculate potential persistent contrail regions
@@ -263,6 +309,7 @@ def calculate_contrail_temperature_and_rh(
     air_temperature: ArrayLike,
     air_pressure: ArrayLike,
     G: ArrayLike,
+    tzeroC: float = -273.15,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Calculate critical temperature and RH thresholds from G parameter.
 
@@ -276,6 +323,10 @@ def calculate_contrail_temperature_and_rh(
         Air pressure, [:math:`Pa`]
     G : ArrayLike
         Schmidt-Appleman G parameter (dimensionless), already broadcast to grid
+    tzeroC : float, optional
+        Absolute zero temperature [:math:`C`], used to convert Celsius to Kelvin
+        via ``T_K = T_C - tzeroC``.  Defaults to ``-273.15``, matching
+        ``pycontrails.physics.constants.absolute_zero``.
 
     Returns
     -------
@@ -304,8 +355,8 @@ def calculate_contrail_temperature_and_rh(
     log_term = xr.where(mask, np.log(G - 0.053), np.nan)
     T_contr_C = -46.46 + 9.43 * log_term + 0.72 * log_term**2
 
-    # Convert to Kelvin (absolute_zero is -273.15, so subtract it to convert C to K)
-    T_contr = xr.where(mask, T_contr_C - constants.absolute_zero, np.nan)
+    # Convert Celsius to Kelvin: T_K = T_C - tzeroC  (tzeroC = -273.15 [C])
+    T_contr = xr.where(mask, T_contr_C - tzeroC, np.nan)
 
     # Critical RH over liquid water
     # Use xarray arithmetic which handles broadcasting
