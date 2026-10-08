@@ -151,6 +151,17 @@ class UPCOM(Model):
     ----------
     met : MetDataset
         Dataset containing "air_temperature" and "specific_humidity" variables
+    emissions : MetDataset | None, optional
+        Emission-rate densities on exactly the same longitude, latitude, level,
+        and time grid as ``met``. Only gridded evaluation is supported when provided.
+        Input units and missing values are preserved; no interpolation or unit
+        conversion is performed.
+    emissions_mapping : Mapping[str, str] | None, optional
+        Map canonical names ``fuel_rate``, ``distance_rate``, and ``particle_rate``
+        to input variable names, for example ``{"fuel_rate": "FUELBURN"}``.
+        Omitted entries default to zero. If None, canonical input names are used
+        when present and otherwise default to zero. Explicitly mapped input
+        variables must exist.
 
     Examples
     --------
@@ -186,6 +197,85 @@ class UPCOM(Model):
     met_variables: tuple[MetVariable, ...] = AirTemperature, SpecificHumidity
     default_params = UPCOMParams
 
+    def __init__(
+        self,
+        met: MetDataset | None = None,
+        params: ModelParams | dict[str, Any] | None = None,
+        *,
+        emissions: MetDataset | None = None,
+        emissions_mapping: Mapping[str, str] | None = None,
+        **params_kwargs: Any,
+    ) -> None:
+        super().__init__(met=met, params=params, **params_kwargs)
+        if emissions is not None and not isinstance(emissions, MetDataset):
+            raise TypeError("emissions must be a MetDataset")
+        self.emissions = emissions
+        self.emissions_mapping = (
+            dict(emissions_mapping) if emissions_mapping is not None else None
+        )
+        canonical_names = {"fuel_rate", "distance_rate", "particle_rate"}
+        if self.emissions_mapping is not None:
+            unknown = self.emissions_mapping.keys() - canonical_names
+            if unknown:
+                raise ValueError(f"Unknown canonical emissions names: {sorted(unknown)}")
+            for canonical_name, input_name in self.emissions_mapping.items():
+                if not isinstance(input_name, str) or not input_name:
+                    raise ValueError(f"Invalid input variable name for {canonical_name!r}")
+                if emissions is None or input_name not in emissions.data:
+                    raise KeyError(f"Mapped emissions variable {input_name!r} is missing")
+        if emissions is not None:
+            assert self.met is not None
+            self._validate_emissions_grid(self.met.data["air_temperature"])
+
+    def _validate_emissions_grid(self, template: xr.DataArray) -> None:
+        assert self.emissions is not None
+        dimensions = {"longitude", "latitude", "level", "time"}
+        if set(self.emissions.data.dims) != dimensions:
+            raise ValueError("Emissions must have longitude, latitude, level, and time dimensions")
+        for dimension in dimensions:
+            if not self.emissions.data.get_index(dimension).equals(template.get_index(dimension)):
+                raise ValueError(f"Emissions {dimension!r} coordinate must match the evaluation grid")
+
+    def _set_source_emissions(self) -> None:
+        template = self.source.data["air_temperature"]
+        if self.emissions is not None:
+            if not isinstance(self.source, MetDataset):
+                raise NotImplementedError("Emissions are only supported for gridded evaluation")
+            self._validate_emissions_grid(template)
+
+        rate_fields = {
+            "fuel_rate": ("Fuel emission-rate density", "kg m**-2 s**-1"),
+            "distance_rate": ("Flown-distance rate density", "km m**-2 s**-1"),
+            "particle_rate": ("Particle emission-rate density", "kg m**-2 s**-1"),
+        }
+        for canonical_name, (long_name, units) in rate_fields.items():
+            if self.emissions_mapping is None:
+                input_name = canonical_name
+            else:
+                input_name = self.emissions_mapping.get(canonical_name)
+                if input_name is not None and (
+                    self.emissions is None or input_name not in self.emissions.data
+                ):
+                    raise KeyError(f"Mapped emissions variable {input_name!r} is missing")
+            if (
+                self.emissions is not None
+                and input_name is not None
+                and input_name in self.emissions.data
+            ):
+                field = self.emissions.data[input_name]
+                if set(field.dims) != set(template.dims):
+                    raise ValueError(f"Emissions variable {input_name!r} must span all grid dimensions")
+                field = field.reset_coords(drop=True).transpose(*template.dims).copy(deep=False)
+                field.attrs = dict(field.attrs)
+                field.attrs.setdefault("long_name", long_name)
+                field.attrs["emissions_source_variable"] = input_name
+            elif isinstance(template, xr.DataArray):
+                field = xr.zeros_like(template)
+                field.attrs = {"long_name": long_name, "units": units}
+            else:
+                field = np.zeros_like(template)
+            self.source[canonical_name] = field
+
     @overload
     def eval(self, source: Flight, **params: Any) -> Flight: ...
 
@@ -211,15 +301,18 @@ class UPCOM(Model):
         Returns
         -------
         GeoVectorDataset | Flight | MetDataset
-            Returns source with additional data variables:
+        Returns source with additional data variables:
             - ``rhi``: Relative humidity over ice
             - ``rh_liquid``: Relative humidity over liquid water
             - ``issr``: Ice supersaturated regions (1 where RHi > threshold, 0 elsewhere)
             - ``sac``: Schmidt-Appleman criterion (1 where both SAC thresholds are met)
+            - ``contrail_flag``: 1 where SAC holds and both fuel and distance rates are positive, 0 elsewhere
             - ``G``: Schmidt-Appleman G parameter
             - ``T_contr``: Critical contrail formation temperature [K]
             - ``RH_contr``: Critical relative humidity threshold
             - ``potential_persistent_contrail``: Regions favorable for persistent contrails
+            - ``persistent_contrail``: 1 where potential persistence and contrail_flag both hold
+             - ``fuel_rate``, ``distance_rate``, ``particle_rate``: Emission-rate densities, preserving supplied units or zero when omitted
 
         Raises
         ------
@@ -230,6 +323,9 @@ class UPCOM(Model):
         self.update_params(params)
         self.set_source(source)
 
+        if self.emissions is not None and not isinstance(self.source, MetDataset):
+            raise NotImplementedError("Emissions are only supported for gridded evaluation")
+
         if isinstance(self.source, GeoVectorDataset):
             self.downselect_met()
             self.source.setdefault("air_pressure", self.source.air_pressure)
@@ -238,6 +334,7 @@ class UPCOM(Model):
         scale_humidity = humidity_scaling is not None and "specific_humidity" not in self.source
 
         self.set_source_met()
+        self._set_source_emissions()
 
         # Apply humidity scaling, warn if no scaling is provided for ECMWF data
         if scale_humidity:
@@ -273,6 +370,16 @@ class UPCOM(Model):
         # Potential persistence requires both ice supersaturation and SAC.
         potential_persistent_contrail = ((issr == 1) & (sac_flag == 1)).astype(rhi.dtype)
 
+        contrail_flag = (
+            (sac_flag == 1)
+            & (self.source.data["fuel_rate"] > 0)
+            & (self.source.data["distance_rate"] > 0)
+        ).astype(sac_flag.dtype)
+
+        persistent_contrail = (
+            (potential_persistent_contrail == 1) & (contrail_flag == 1)
+        ).astype(contrail_flag.dtype)
+
         # Update source with calculated fields and set proper attributes
         self.source.data["rhi"] = rhi
         self.source.data["rhi"].attrs = {
@@ -298,6 +405,13 @@ class UPCOM(Model):
             "long_name": "Schmidt-Appleman criterion",
             "units": "dimensionless",
             "description": "1 where air_temperature < T_contr and rh_liquid > RH_contr",
+        }
+
+        self.source.data["contrail_flag"] = contrail_flag
+        self.source.data["contrail_flag"].attrs = {
+            "long_name": "Contrail formation with emissions",
+            "units": "dimensionless",
+            "description": "1 where sac == 1, fuel_rate > 0, and distance_rate > 0; 0 elsewhere",
         }
         
         self.source.data["G"] = G
@@ -327,6 +441,13 @@ class UPCOM(Model):
             "long_name": "Potential persistent contrail regions",
             "units": "dimensionless",
             "description": "1 where conditions favor persistent contrails, 0 elsewhere",
+        }
+
+        self.source.data["persistent_contrail"] = persistent_contrail
+        self.source.data["persistent_contrail"].attrs = {
+            "long_name": "Persistent contrail formation with emissions",
+            "units": "dimensionless",
+            "description": "1 where potential_persistent_contrail == 1 and contrail_flag == 1; 0 elsewhere",
         }
 
         # Tag output with additional metadata attrs

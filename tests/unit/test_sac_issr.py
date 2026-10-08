@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from pycontrails import Flight, JetA, MetDataArray, MetDataset
+from pycontrails import Flight, GeoVectorDataset, JetA, MetDataArray, MetDataset
 from pycontrails.core.met import originates_from_ecmwf
 from pycontrails.models import sac
 from pycontrails.models.humidity_scaling import (
@@ -19,6 +19,7 @@ from pycontrails.models.humidity_scaling import (
 from pycontrails.models.issr import ISSR
 from pycontrails.models.pcr import PCR
 from pycontrails.models.sac import SAC
+from pycontrails.models.upcom import UPCOM
 from pycontrails.physics import constants, thermo, units
 from tests import _deprecated
 
@@ -26,6 +27,200 @@ from tests import _deprecated
 # 1) Downselect met results in copy
 # 2) Check downselect met bounds
 # 4) Default params for SAC, etc
+
+
+@pytest.fixture
+def upcom_met() -> MetDataset:
+    """Small grid for emission ingestion tests without external meteorology."""
+    coords = {
+        "longitude": [0.0, 1.0],
+        "latitude": [40.0, 41.0],
+        "level": [200.0, 250.0],
+        "time": np.array(["2022-03-01T00", "2022-03-01T01"], dtype="datetime64[ns]"),
+    }
+    return MetDataset(
+        xr.Dataset(
+            {
+                "air_temperature": (tuple(coords), np.full((2, 2, 2, 2), 225.0)),
+                "specific_humidity": (tuple(coords), np.full((2, 2, 2, 2), 1e-4)),
+            },
+            coords=coords,
+        )
+    )
+
+
+def test_upcom_emissions_mapping(upcom_met: MetDataset) -> None:
+    """Mapped rates preserve values, units, NaNs, laziness, and input data."""
+    template = upcom_met.data["air_temperature"]
+    fuel = xr.full_like(template, 2.0)
+    fuel.values[0, 0, 0, 0] = np.nan
+    fuel.attrs = {"units": "kg/m2/s", "long_name": "Inventory fuel burn"}
+    emissions = MetDataset(
+        xr.Dataset(
+            {
+                "FUELBURN": fuel.chunk({"longitude": 1}),
+                "DISTANCE": xr.full_like(template, 3.0).assign_attrs(units="km/m2/s"),
+                "BC": xr.full_like(template, 4.0).assign_attrs(units="kg/m2/s"),
+            }
+        ).assign_coords(altitude=("level", [10000.0, 9000.0]))
+    )
+    original_met = upcom_met.data.copy(deep=True)
+    original_emissions = emissions.data.copy(deep=True)
+    mapping = {"fuel_rate": "FUELBURN", "distance_rate": "DISTANCE", "particle_rate": "BC"}
+    model = UPCOM(upcom_met, emissions=emissions, emissions_mapping=mapping)
+    mapping["fuel_rate"] = "changed_after_construction"
+    result = model.eval()
+
+    for canonical_name, input_name in model.emissions_mapping.items():
+        np.testing.assert_allclose(result.data[canonical_name], emissions.data[input_name])
+        assert result.data[canonical_name].attrs["units"] == emissions.data[input_name].attrs["units"]
+        assert result.data[canonical_name].attrs["emissions_source_variable"] == input_name
+    assert hasattr(result.data["fuel_rate"].data, "__dask_graph__")
+    assert np.isnan(result.data["fuel_rate"].isel(longitude=0, latitude=0, level=0, time=0))
+    xr.testing.assert_identical(upcom_met.data, original_met)
+    xr.testing.assert_identical(emissions.data, original_emissions)
+    baseline = UPCOM(upcom_met).eval()
+    for variable in ("sac", "issr", "potential_persistent_contrail"):
+        xr.testing.assert_identical(result.data[variable], baseline.data[variable])
+
+
+@pytest.mark.parametrize("mapping", [None, {}, {"fuel_rate": "fuel_rate"}])
+def test_upcom_emissions_defaults(upcom_met: MetDataset, mapping: dict | None) -> None:
+    """Canonical lookup and partial mappings produce the expected zero defaults."""
+    emissions = MetDataset(
+        xr.Dataset({"fuel_rate": xr.full_like(upcom_met.data["air_temperature"], 2.0)})
+    )
+    result = UPCOM(upcom_met, emissions=emissions, emissions_mapping=mapping).eval()
+    np.testing.assert_allclose(result.data["fuel_rate"], 0.0 if mapping == {} else 2.0)
+    for name in ("distance_rate", "particle_rate"):
+        xr.testing.assert_equal(result.data[name], xr.zeros_like(result.data["air_temperature"]).rename(name))
+
+
+def test_upcom_without_emissions(upcom_met: MetDataset) -> None:
+    """All rates are zero when no inventory is supplied."""
+    result = UPCOM(upcom_met).eval()
+    for name in ("fuel_rate", "distance_rate", "particle_rate"):
+        np.testing.assert_array_equal(result.data[name], 0.0)
+    np.testing.assert_array_equal(result.data["contrail_flag"], 0.0)
+    np.testing.assert_array_equal(result.data["persistent_contrail"], 0.0)
+
+
+@pytest.mark.parametrize("issr_holds", [False, True])
+@pytest.mark.parametrize(
+    ("fuel_rate", "distance_rate", "sac_holds", "expected"),
+    [
+        (1.0, 1.0, True, 1.0),
+        (1.0, 0.0, True, 0.0),
+        (0.0, 1.0, True, 0.0),
+        (0.0, 0.0, True, 0.0),
+        (-1.0, 1.0, True, 0.0),
+        (1.0, -1.0, True, 0.0),
+        (np.nan, 1.0, True, 0.0),
+        (1.0, np.nan, True, 0.0),
+        (1.0, 1.0, False, 0.0),
+    ],
+)
+def test_upcom_contrail_flag(
+    upcom_met: MetDataset,
+    fuel_rate: float,
+    distance_rate: float,
+    sac_holds: bool,
+    expected: float,
+    issr_holds: bool,
+) -> None:
+    """Emission-gated formation requires SAC; persistence additionally requires ISSR."""
+    template = upcom_met.data["air_temperature"]
+    upcom_met.data["air_temperature"] = xr.full_like(template, 200.0 if sac_holds else 260.0)
+    emissions = MetDataset(
+        xr.Dataset(
+            {
+                "fuel_rate": xr.full_like(template, fuel_rate),
+                "distance_rate": xr.full_like(template, distance_rate),
+            }
+        ).chunk({"longitude": 1})
+    )
+    result = UPCOM(
+        upcom_met, emissions=emissions, rhi_threshold=1.0 if issr_holds else 1e6
+    ).eval()
+    np.testing.assert_array_equal(result.data["sac"], float(sac_holds))
+    np.testing.assert_array_equal(result.data["issr"], float(issr_holds and sac_holds))
+    np.testing.assert_array_equal(result.data["particle_rate"], 0.0)
+    np.testing.assert_array_equal(result.data["contrail_flag"], expected)
+    assert hasattr(result.data["contrail_flag"].data, "__dask_graph__")
+    assert result.data["contrail_flag"].dims == result.data["sac"].dims
+    assert result.data["contrail_flag"].dtype == result.data["sac"].dtype
+    assert result.data["contrail_flag"].attrs["units"] == "dimensionless"
+    np.testing.assert_array_equal(result.data["persistent_contrail"], expected if issr_holds else 0.0)
+    assert hasattr(result.data["persistent_contrail"].data, "__dask_graph__")
+    assert result.data["persistent_contrail"].dims == result.data["contrail_flag"].dims
+    assert result.data["persistent_contrail"].dtype == result.data["contrail_flag"].dtype
+    assert result.data["persistent_contrail"].attrs["units"] == "dimensionless"
+
+
+@pytest.mark.parametrize("dimension", ["longitude", "latitude", "level", "time"])
+def test_upcom_emissions_grid_mismatch(upcom_met: MetDataset, dimension: str) -> None:
+    """Reject shifted coordinates instead of silently interpolating or aligning."""
+    emissions = xr.Dataset({"fuel_rate": xr.zeros_like(upcom_met.data["air_temperature"])})
+    offset = np.timedelta64(1, "h") if dimension == "time" else 0.01
+    emissions = emissions.assign_coords({dimension: emissions[dimension] + offset})
+    with pytest.raises(ValueError, match=dimension):
+        UPCOM(upcom_met, emissions=MetDataset(emissions))
+
+
+@pytest.mark.parametrize(
+    ("mapping", "error", "message"),
+    [
+        ({"fuelmass": "FUELBURN"}, ValueError, "Unknown canonical"),
+        ({"fuel_rate": "typo"}, KeyError, "missing"),
+        ({"fuel_rate": ""}, ValueError, "Invalid input"),
+    ],
+)
+def test_upcom_emissions_invalid_mapping(
+    upcom_met: MetDataset, mapping: dict, error: type[Exception], message: str
+) -> None:
+    """Explicit mapping errors must not silently produce zero emissions."""
+    emissions = MetDataset(
+        xr.Dataset({"FUELBURN": xr.zeros_like(upcom_met.data["air_temperature"])})
+    )
+    with pytest.raises(error, match=message):
+        UPCOM(upcom_met, emissions=emissions, emissions_mapping=mapping)
+
+
+def test_upcom_emissions_missing_dataset(upcom_met: MetDataset) -> None:
+    """Explicit mappings require an inventory."""
+    with pytest.raises(KeyError, match="missing"):
+        UPCOM(upcom_met, emissions_mapping={"fuel_rate": "FUELBURN"})
+
+
+def test_upcom_emissions_variable_dimensions(upcom_met: MetDataset) -> None:
+    """Reject fields missing a grid dimension even when dataset coordinates match."""
+    emissions = MetDataset(
+        xr.Dataset(
+            {"fuel_rate": upcom_met.data["air_temperature"].isel(time=0, drop=True)},
+            coords=upcom_met.data.coords,
+        )
+    )
+    with pytest.raises(ValueError, match="span all grid dimensions"):
+        UPCOM(upcom_met, emissions=emissions).eval()
+
+
+def test_upcom_emissions_evaluation_grid(upcom_met: MetDataset) -> None:
+    """Reject a different source grid or a trajectory when an inventory is supplied."""
+    emissions = MetDataset(
+        xr.Dataset({"fuel_rate": xr.zeros_like(upcom_met.data["air_temperature"])})
+    )
+    model = UPCOM(upcom_met, emissions=emissions)
+    source = MetDataset(upcom_met.data.isel(longitude=slice(0, 1)))
+    with pytest.raises(ValueError, match="longitude"):
+        model.eval(source)
+    trajectory = GeoVectorDataset(
+        longitude=[0.0],
+        latitude=[40.0],
+        level=[200.0],
+        time=np.array(["2022-03-01T00"], dtype="datetime64[ns]"),
+    )
+    with pytest.raises(NotImplementedError, match="gridded"):
+        model.eval(trajectory)
 
 
 def test_ISSR_met_source(met_issr: MetDataset) -> None:

@@ -1,6 +1,6 @@
-"""AEIC (Aviation Emissions Inventory Code) gridded monthly data access.
+"""AEIC (Aviation Emissions Inventory Code) gridded emissions data access.
 
-Provides a :class:`AEIC` data source class that reads monthly mean gridded
+Provides a :class:`AEIC` data source class that reads monthly mean or daily gridded
 aircraft emissions from local netCDF files and returns them as a
 :class:`~pycontrails.core.met.MetDataset`, compatible with the rest of the
 pycontrails model pipeline (e.g. UPCoM).
@@ -8,6 +8,7 @@ pycontrails model pipeline (e.g. UPCoM).
 File naming convention expected on disk::
 
     <data_dir>/AEIC_monmean_YYYYMM.nc
+    <data_dir>/AEIC_YYYYMMDD.0.5x0.625.36L.nc
 
 Examples
 --------
@@ -30,6 +31,16 @@ Restrict to a specific list of pressure levels (hPa):
 ...     pressure_levels=[200, 250, 300],
 ... )
 >>> emis = aeic.open_metdataset()
+
+Load daily files from a month-specific directory:
+
+>>> aeic = AEIC(
+...     time=("2019-03-01", "2019-03-02"),
+...     variables=["FUELBURN", "BC", "DISTANCE"],
+...     data_dir="/path/to/AEIC/daily/03",
+...     frequency="daily",
+... )
+>>> emis = aeic.open_metdataset()
 """
 
 from __future__ import annotations
@@ -39,7 +50,7 @@ import logging
 import pathlib
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -62,6 +73,15 @@ LOG = logging.getLogger(__name__)
 
 #: Pressure levels (hPa) selected by default — aviation cruise band.
 DEFAULT_PRESSURE_LEVELS: list[int] = [150, 175, 200, 225, 250, 275, 300, 350, 400]
+
+AEIC_PRESSURE_LEVELS: tuple[float, ...] = (
+    1005.6505, 990.408, 975.1225, 959.8375, 944.553, 929.2685,
+    913.984, 898.7005, 883.4175, 868.1345, 852.852, 837.57,
+    819.7425, 796.822, 771.3545, 745.8905, 720.4295, 694.969,
+    663.1465, 624.967, 586.793, 548.628, 510.4755, 472.335,
+    434.212, 396.1125, 358.0375, 313.966, 267.0865, 226.745,
+    192.587, 163.6615, 139.115, 118.25, 100.5145, 85.439,
+)
 
 
 def _parse_monthly_timesteps(time: metsource.TimeInput) -> list[datetime]:
@@ -111,8 +131,18 @@ def _parse_monthly_timesteps(time: metsource.TimeInput) -> list[datetime]:
     return date_range.to_pydatetime().tolist()
 
 
+def _parse_daily_timesteps(time: metsource.TimeInput) -> list[datetime]:
+    """Enumerate calendar days containing the requested bounds, inclusively."""
+    bounds = metsource.parse_timesteps(time, freq=None)
+    return pd.date_range(
+        pd.Timestamp(bounds[0]).normalize(),
+        pd.Timestamp(bounds[-1]).normalize(),
+        freq="D",
+    ).to_pydatetime().tolist()
+
+
 class AEIC(metsource.MetDataSource):
-    """Data source for AEIC monthly gridded aircraft emissions.
+    """Data source for AEIC monthly or daily gridded aircraft emissions.
 
     Reads local netCDF files produced by the Aviation Emissions Inventory Code
     (AEIC, Eastham & Wofsy) and returns a :class:`MetDataset` with dimensions
@@ -124,7 +154,8 @@ class AEIC(metsource.MetDataSource):
     time : metsource.TimeInput | None
         The time range for data retrieval.  Pass a single month string
         (``"2019-01"``) or a (start, end) pair (``("2019-01", "2019-12")``).
-        Months are enumerated at monthly ("MS") frequency.
+        With ``frequency="daily"``, pass calendar dates instead, for example
+        ``("2019-03-01", "2019-03-02")``. Both endpoint days are included.
         If *None*, ``paths`` must be provided.
     variables : metsource.VariableInput
         Variable names to load.  Accepts short names (``"FUELBURN"``,
@@ -138,8 +169,10 @@ class AEIC(metsource.MetDataSource):
         150–400 hPa is used.  Pass the special value ``-1`` for
         surface/single-level data (not typical for AEIC).
     data_dir : str | pathlib.Path
-        Directory containing the AEIC monthly netCDF files.
-        Files are expected to be named ``AEIC_monmean_YYYYMM.nc``.
+        Directory containing the AEIC netCDF files. Monthly files are named
+        ``AEIC_monmean_YYYYMM.nc``; daily files are named
+        ``AEIC_YYYYMMDD.0.5x0.625.36L.nc``. For daily files stored in monthly
+        subdirectories, supply the subdirectory itself.
     paths : str | list[str] | pathlib.Path | list[pathlib.Path] | None, optional
         Explicit file paths to load, overriding the ``data_dir`` /
         time-based file discovery.  Supports glob patterns.
@@ -148,11 +181,16 @@ class AEIC(metsource.MetDataSource):
         Unused for AEIC (data is local).  Retained for API compatibility
         with other :class:`~pycontrails.datalib._met_utils.metsource.MetDataSource`
         subclasses.  Defaults to *None*.
+    frequency : {"monthly", "daily"}, optional
+        File frequency, default "monthly". Controls date enumeration, generated
+        filenames, and product metadata. Internal file timestamps are preserved.
+        Daily files with ``lev=1..36`` and units ``"level"`` use the fixed AEIC
+        36-level pressure grid, ordered from the surface upwards.
 
     Raises
     ------
     FileNotFoundError
-        Raised at construction time if any expected monthly file is not
+        Raised at construction time if any expected file is not
         present in ``data_dir``.
     ValueError
         Raised if ``time`` is *None* and ``paths`` is also *None*.
@@ -169,10 +207,11 @@ class AEIC(metsource.MetDataSource):
     Frozen({'longitude': 576, 'latitude': 361, 'level': 9, 'time': 3})
     """
 
-    __slots__ = ("cachestore", "data_dir")
+    __slots__ = ("cachestore", "data_dir", "frequency")
 
-    #: Root directory containing AEIC monthly netCDF files.
+    #: Directory containing AEIC netCDF files.
     data_dir: pathlib.Path
+    frequency: Literal["monthly", "daily"]
 
     def __init__(
         self,
@@ -182,9 +221,14 @@ class AEIC(metsource.MetDataSource):
         data_dir: str | pathlib.Path = ".",
         paths: str | list[str] | pathlib.Path | list[pathlib.Path] | None = None,
         cachestore: cache_module.CacheStore | None = None,
+        *,
+        frequency: Literal["monthly", "daily"] = "monthly",
     ) -> None:
         if time is None and paths is None:
             raise ValueError("Parameter 'time' must be provided when 'paths' is None.")
+        if frequency not in ("monthly", "daily"):
+            raise ValueError("frequency must be 'monthly' or 'daily'")
+        self.frequency = frequency
 
         # Store data directory
         self.data_dir = pathlib.Path(data_dir)
@@ -198,10 +242,12 @@ class AEIC(metsource.MetDataSource):
         # Grid spacing — not fixed for AEIC, set to None
         self.grid = None
 
-        # Parse timesteps at monthly (month-start) frequency.
-        # parse_timesteps() uses Timestamp.floor() which doesn't support the
-        # non-fixed "MS" offset, so we use _parse_monthly_timesteps instead.
-        self.timesteps = _parse_monthly_timesteps(time) if time is not None else []
+        if time is None:
+            self.timesteps = []
+        elif self.frequency == "daily":
+            self.timesteps = _parse_daily_timesteps(time)
+        else:
+            self.timesteps = _parse_monthly_timesteps(time)
 
         # Parse variables against supported list
         self.variables = metsource.parse_variables(variables, AEIC_VARIABLES)
@@ -217,7 +263,7 @@ class AEIC(metsource.MetDataSource):
             self._validate_files()
 
     def _validate_files(self) -> None:
-        """Check that all expected monthly files are present in :attr:`data_dir`.
+        """Check that all expected files are present in :attr:`data_dir`.
 
         Raises
         ------
@@ -233,7 +279,7 @@ class AEIC(metsource.MetDataSource):
         if missing:
             missing_str = "\n  ".join(missing)
             raise FileNotFoundError(
-                f"The following AEIC monthly files were not found:\n  {missing_str}"
+                f"The following AEIC {self.frequency} files were not found:\n  {missing_str}"
             )
 
     # ------------------------------------------------------------------
@@ -255,6 +301,7 @@ class AEIC(metsource.MetDataSource):
             f"{self.variable_shortnames}"
             f"{self.pressure_levels}"
             f"{self.data_dir}"
+            f"{self.frequency}"
         )
         return hashlib.sha1(bytes(hashstr, "utf-8")).hexdigest()
 
@@ -271,12 +318,12 @@ class AEIC(metsource.MetDataSource):
 
     @override
     def create_cachepath(self, t: datetime) -> str:
-        """Return the expected path to the AEIC monthly file for datetime *t*.
+        """Return the expected path to the AEIC file for datetime *t*.
 
         Parameters
         ----------
         t : datetime
-            Month represented by the file.  Only ``year`` and ``month`` are used.
+            Date represented by the file. The day is ignored for monthly files.
 
         Returns
         -------
@@ -284,7 +331,10 @@ class AEIC(metsource.MetDataSource):
             Absolute path to the file, e.g.
             ``/data/AEIC/monthly/AEIC_monmean_201901.nc``.
         """
-        fname = f"AEIC_monmean_{t.year}{t.month:02d}.nc"
+        if self.frequency == "daily":
+            fname = f"AEIC_{t:%Y%m%d}.0.5x0.625.36L.nc"
+        else:
+            fname = f"AEIC_monmean_{t.year}{t.month:02d}.nc"
         return str(self.data_dir / fname)
 
     @override
@@ -323,7 +373,7 @@ class AEIC(metsource.MetDataSource):
         ds.attrs.update(
             provider="AEIC",
             dataset="AEIC",
-            product="monthly",
+            product=self.frequency,
         )
 
     @override
@@ -412,6 +462,22 @@ class AEIC(metsource.MetDataSource):
             rename_map["lev"] = "level"
         if rename_map:
             ds = ds.rename(rename_map)
+
+        if self.frequency == "daily" and ds["level"].attrs.get("units") == "level":
+            if not np.array_equal(ds["level"].values, np.arange(1, 37)):
+                raise ValueError("Indexed daily AEIC levels must be the standard 1..36 grid")
+            ds = ds.assign_coords(
+                level=xr.DataArray(
+                    np.asarray(AEIC_PRESSURE_LEVELS),
+                    dims="level",
+                    attrs={
+                        "units": "hPa",
+                        "standard_name": "air_pressure",
+                        "long_name": "Pressure",
+                        "positive": "down",
+                    },
+                )
+            )
 
         # 2. Select requested variables (by short_name)
         var_names = self.variable_shortnames
